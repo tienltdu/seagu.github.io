@@ -1,0 +1,450 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Flood Map (Local)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- GeoTIFF raster support -->
+  <script src="https://unpkg.com/geotiff@2.1.3/dist-browser/geotiff.js"></script>
+  <script src="https://unpkg.com/georaster@1.6.0/dist/georaster.browser.bundle.min.js"></script>
+  <script src="https://unpkg.com/georaster-layer-for-leaflet@3.10.0/dist/georaster-layer-for-leaflet.min.js"></script>
+
+  <style>
+    html, body { height: 100%; margin: 0; }
+    #app { height: 100%; display: flex; }
+
+    /* LEFT PANEL */
+    #sidebar {
+      width: 340px;
+      background: rgba(20, 20, 20, 0.92);
+      color: #fff;
+      padding: 12px;
+      box-sizing: border-box;
+      overflow: hidden;
+      border-right: 1px solid rgba(255,255,255,0.12);
+      font: 13px system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    #sidebar h2 {
+      margin: 0;
+      font-size: 16px;
+      font-weight: 700;
+    }
+
+    .small-note { font-size: 12px; opacity: 0.85; line-height: 1.35; }
+
+    input, button {
+      width: 100%;
+      padding: 9px 10px;
+      border-radius: 10px;
+      border: 1px solid rgba(255,255,255,0.25);
+      background: rgba(255,255,255,0.08);
+      color: white;
+      outline: none;
+      font-size: 13px;
+      box-sizing: border-box;
+    }
+
+    button {
+      cursor: pointer;
+      background: rgba(255,255,255,0.14);
+    }
+    button:hover { background: rgba(255,255,255,0.20); }
+
+    /* AOI result list */
+    #aoiInfo {
+      font-size: 12px;
+      opacity: 0.9;
+    }
+
+    #aoiList {
+      flex: 1;
+      overflow: auto;
+      border: 1px solid rgba(255,255,255,0.18);
+      border-radius: 10px;
+      background: rgba(0,0,0,0.15);
+    }
+
+    .aoi-item {
+      padding: 8px 10px;
+      border-bottom: 1px solid rgba(255,255,255,0.10);
+      cursor: pointer;
+      user-select: none;
+    }
+    .aoi-item:hover { background: rgba(255,255,255,0.08); }
+    .aoi-item:last-child { border-bottom: none; }
+
+    /* MAP */
+    #map { flex: 1; height: 100%; }
+
+    /* AOI label style */
+    .aoi-label {
+      color: white;
+      font-weight: 700;
+      font-size: 12px;
+      text-shadow:
+        -1px -1px 0 rgba(0,0,0,.85),
+         1px -1px 0 rgba(0,0,0,.85),
+        -1px  1px 0 rgba(0,0,0,.85),
+         1px  1px 0 rgba(0,0,0,.85);
+      white-space: nowrap;
+      pointer-events: none;
+    }
+
+    /* Legend */
+    .legend {
+      background: rgba(255,255,255,0.95);
+      padding: 8px 10px;
+      border-radius: 6px;
+      box-shadow: 0 1px 6px rgba(0,0,0,.25);
+      font: 12px system-ui, sans-serif;
+      line-height: 1.4;
+      max-width: 320px;
+    }
+  </style>
+</head>
+
+<body>
+<div id="app">
+  <!-- LEFT SIDEBAR -->
+  <div id="sidebar">
+    <h2>Flood Map</h2>
+
+    <div class="small-note">
+      Type in the search box to find <b>ten_xa</b>, then click a result to zoom.
+    </div>
+
+    <input id="aoiSearch" type="text" placeholder="Search ten_xa..." />
+
+    <div id="aoiInfo">Loading AOIs...</div>
+
+    <div id="aoiList"></div>
+
+    <button id="zoomAllBtn">Zoom to full AOI</button>
+
+    <div class="small-note">
+      • Basemap: Satellite<br>
+      • Flood pixel: 1 (colored), 0 transparent<br>
+      • Permanent water: 1 (cyan), on top<br>
+    </div>
+  </div>
+
+  <!-- MAP -->
+  <div id="map"></div>
+</div>
+
+<script>
+  // ==================================================
+  // 1) MAP INIT (Satellite basemap)
+  // ==================================================
+  const map = L.map("map", { preferCanvas: true });
+
+  const esriSat = L.tileLayer(
+    "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    { maxZoom: 19, attribution: "Tiles © Esri" }
+  ).addTo(map);
+
+  const esriLabels = L.tileLayer(
+    "https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}",
+    { maxZoom: 19, opacity: 1.0, attribution: "Labels © Esri" }
+  );
+
+  // ==================================================
+  // 2) PANES (stable order + prevent disappearing rasters)
+  // ==================================================
+  map.createPane("floodPane");
+  map.createPane("waterPane");
+  map.createPane("boundaryPane");
+  map.createPane("labelPane");
+
+  map.getPane("floodPane").style.zIndex = 450;
+  map.getPane("waterPane").style.zIndex = 460;
+  map.getPane("boundaryPane").style.zIndex = 470;
+  map.getPane("labelPane").style.zIndex = 480;
+
+  // ==================================================
+  // 3) LAYER CONTROL
+  // ==================================================
+  const baseLayers = { "Satellite (Esri)": esriSat };
+  const overlays = { "Base labels (Esri)": esriLabels };
+  let layerControl;
+
+  function updateLayerControl() {
+    if (layerControl) layerControl.remove();
+    layerControl = L.control.layers(baseLayers, overlays, { collapsed: false }).addTo(map);
+  }
+  updateLayerControl();
+
+  // ==================================================
+  // 4) HELPERS
+  // ==================================================
+  function fileStem(url) {
+    const name = url.split("/").pop() || url;
+    return name.replace(/\.(tif|tiff)$/i, "");
+  }
+
+  function makeLabelMarker(latlng, text) {
+    return L.marker(latlng, {
+      pane: "labelPane",
+      interactive: false,
+      icon: L.divIcon({
+        className: "",
+        html: `<div class="aoi-label">${text}</div>`
+      })
+    });
+  }
+
+  function boundsFromFeature(feature) {
+    return L.geoJSON(feature).getBounds();
+  }
+
+  // Choose which property to use as label:
+  // Prefer 'ten_xa', but fallback if not present
+  function detectNameField(features) {
+    const candidates = ["ten_xa", "TEN_XA", "Ten_xa", "tenxa", "TENXA", "name", "NAME", "Name"];
+    for (const f of features) {
+      const p = f.properties || {};
+      for (const key of candidates) {
+        if (p[key] !== undefined && p[key] !== null && String(p[key]).trim() !== "") {
+          return key;
+        }
+      }
+    }
+    return null;
+  }
+
+  async function addGeoTiffLayer({
+    url,
+    name,
+    pane,
+    opacity = 1.0,
+    pixelToColorFn,
+    maskGeoJSON
+  }) {
+    const buffer = await fetch(url).then(r => r.arrayBuffer());
+    const georaster = await parseGeoraster(buffer);
+
+    const layer = new GeoRasterLayer({
+      georaster,
+      pane,
+      opacity,
+      resolution: 256,
+      pixelValuesToColorFn: pixelToColorFn,
+
+      // Clip/crop to AOI boundary
+      mask: maskGeoJSON,
+      mask_srs: "EPSG:4326",
+      mask_strategy: "outside"
+    });
+
+    layer.addTo(map);
+    overlays[name] = layer;
+    updateLayerControl();
+    return layer;
+  }
+
+  // ==================================================
+  // 5) COLORS (different flood color per tiff)
+  // ==================================================
+  const floodColors = [
+    "rgba(0, 120, 255, 0.55)",   // blue
+    "rgba(255, 0, 0, 0.45)",     // red
+    "rgba(255, 165, 0, 0.50)",   // orange
+    "rgba(0, 200, 0, 0.45)",     // green
+    "rgba(160, 32, 240, 0.45)",  // purple
+    "rgba(255, 255, 0, 0.45)",   // yellow
+    "rgba(0, 255, 180, 0.45)",   // teal
+    "rgba(255, 105, 180, 0.45)"  // pink
+  ];
+
+  // ==================================================
+  // 6) AOI SEARCH UI
+  // ==================================================
+  const aoiSearch = document.getElementById("aoiSearch");
+  const aoiInfo = document.getElementById("aoiInfo");
+  const aoiList = document.getElementById("aoiList");
+  const zoomAllBtn = document.getElementById("zoomAllBtn");
+
+  let aoiFeatures = [];
+  let aoiNameField = null;
+  let aoiBoundsAll = null;
+
+  function getAoiName(feature) {
+    const p = feature.properties || {};
+    const v = aoiNameField ? p[aoiNameField] : null;
+    return (v === undefined || v === null) ? "" : String(v).trim();
+  }
+
+  function renderAoiList(filterText) {
+    const q = (filterText || "").trim().toLowerCase();
+    aoiList.innerHTML = "";
+
+    const filtered = aoiFeatures
+      .map((f, idx) => ({ f, idx, name: getAoiName(f) }))
+      .filter(x => x.name !== "")
+      .filter(x => q === "" ? true : x.name.toLowerCase().includes(q))
+      .sort((a,b) => a.name.localeCompare(b.name));
+
+    aoiInfo.textContent =
+      `AOIs: ${filtered.length}/${aoiFeatures.length} • field: ${aoiNameField || "NOT FOUND"}`;
+
+    if (filtered.length === 0) {
+      const div = document.createElement("div");
+      div.className = "aoi-item";
+      div.textContent = "No matches. Check field name in GeoJSON.";
+      aoiList.appendChild(div);
+      return;
+    }
+
+    for (const item of filtered) {
+      const div = document.createElement("div");
+      div.className = "aoi-item";
+      div.textContent = item.name;
+      div.addEventListener("click", () => {
+        const b = boundsFromFeature(item.f);
+        map.fitBounds(b.pad(0.15));
+      });
+      aoiList.appendChild(div);
+    }
+  }
+
+  aoiSearch.addEventListener("input", () => {
+    renderAoiList(aoiSearch.value);
+  });
+
+  zoomAllBtn.addEventListener("click", () => {
+    if (aoiBoundsAll) map.fitBounds(aoiBoundsAll.pad(0.05));
+  });
+
+  // ==================================================
+  // 7) LOAD AOI then load rasters clipped to AOI
+  // ==================================================
+  fetch("./CauRB_aoi.geojson")
+    .then(r => r.json())
+    .then(async (aoiGeojson) => {
+
+      // Normalize features list
+      aoiFeatures = (aoiGeojson.type === "FeatureCollection")
+        ? aoiGeojson.features
+        : (aoiGeojson.type === "Feature" ? [aoiGeojson] : []);
+
+      // Detect which property field to use (prefer ten_xa but fallback)
+      aoiNameField = detectNameField(aoiFeatures);
+
+      // AOI boundary (WHITE)
+      const aoiLayer = L.geoJSON(aoiGeojson, {
+        pane: "boundaryPane",
+        style: { color: "#ffffff", weight: 2, opacity: 1.0, fillOpacity: 0 }
+      }).addTo(map);
+
+      overlays["AOI boundary"] = aoiLayer;
+
+      aoiBoundsAll = aoiLayer.getBounds();
+      map.fitBounds(aoiBoundsAll);
+
+      // AOI labels layer (optional toggle)
+      const labelGroup = L.layerGroup([], { pane: "labelPane" }).addTo(map);
+      overlays["AOI labels"] = labelGroup;
+
+      // Add labels only if we found a name field
+      if (aoiNameField) {
+        for (const f of aoiFeatures) {
+          const name = getAoiName(f);
+          if (!name) continue;
+          const center = boundsFromFeature(f).getCenter();
+          labelGroup.addLayer(makeLabelMarker(center, name));
+        }
+      }
+
+      // Render search list now
+      if (!aoiNameField) {
+        aoiInfo.textContent = `No label field found in GeoJSON (ten_xa missing).`;
+      }
+      renderAoiList("");
+
+      updateLayerControl();
+
+      // --------------------------------------------------
+      // Flood TIFFs (EDIT THIS LIST)
+      // Layer name = TIFF filename stem
+      // Value: 1=flood, 0/nodata=transparent
+      // --------------------------------------------------
+      const floodTifs = [
+        "./merged/09-08-2025.tif",
+        "./merged/10-14-2025.tif"
+        // add more...
+      ];
+
+      for (let i = 0; i < floodTifs.length; i++) {
+        const url = floodTifs[i];
+        const layerName = fileStem(url);
+        const color = floodColors[i % floodColors.length];
+
+        await addGeoTiffLayer({
+          url,
+          name: layerName,
+          pane: "floodPane",
+          opacity: 1.0,
+          maskGeoJSON: aoiGeojson,
+          pixelToColorFn: (vals) => (vals[0] === 1 ? color : null)
+        });
+      }
+
+      // --------------------------------------------------
+      // Permanent water (value=1 only) - CYAN on top
+      // --------------------------------------------------
+      await addGeoTiffLayer({
+        url: "./permanent_water_CauRB.tif",
+        name: "Permanent water",
+        pane: "waterPane",
+        opacity: 1.0,
+        maskGeoJSON: aoiGeojson,
+        pixelToColorFn: (vals) => (vals[0] === 1 ? "rgba(0,255,255,0.90)" : null)
+      });
+
+      // --------------------------------------------------
+      // Legend
+      // --------------------------------------------------
+      const legend = L.control({ position: "bottomright" });
+      legend.onAdd = function () {
+        const div = L.DomUtil.create("div", "legend");
+
+        const floodLegend = floodTifs.slice(0, 12).map((u, i) => {
+          const c = floodColors[i % floodColors.length];
+          return `
+            <div>
+              <span style="display:inline-block;width:12px;height:12px;background:${c};margin-right:6px;"></span>
+              ${fileStem(u)}
+            </div>`;
+        }).join("");
+
+        div.innerHTML = `
+          <b>Legend</b><br>
+          <div>
+            <span style="display:inline-block;width:12px;height:12px;background:rgba(0,255,255,0.90);margin-right:6px;"></span>
+            Permanent water
+          </div>
+          <div style="margin-top:6px;"><b>Flood layers</b></div>
+          ${floodLegend}
+          <div style="margin-top:6px;">
+            <span style="display:inline-block;width:14px;height:2px;background:#fff;margin:0 6px 4px 0; border:1px solid rgba(0,0,0,0.2);"></span>
+            AOI boundary
+          </div>
+        `;
+        return div;
+      };
+      legend.addTo(map);
+
+      updateLayerControl();
+    });
+</script>
+</body>
+</html>
